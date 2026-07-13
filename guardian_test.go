@@ -315,3 +315,14 @@ func TestGuardianGuardUnguardIDsCase2(t *testing.T) {
 		t.Errorf("\nExpected <%+v>, \nReceived <%+v>", mockErr, err)
 	}
 }
+
+func TestSortedUniqueKeys(t *testing.T) {
+	input := []string{"b", "a", "b"}
+	want := []string{"a", "b"}
+	if got := sortedUniqueKeys(input); !reflect.DeepEqual(got, want) {
+		t.Errorf("sortedUniqueKeys() = %v, want %v", got, want)
+	}
+	if !reflect.DeepEqual(input, []string{"b", "a", "b"}) {
+		t.Errorf("sortedUniqueKeys() modified input: %v", input)
+	}
+}

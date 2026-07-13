@@ -20,6 +20,7 @@ package guardian
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -61,6 +62,7 @@ type itemLock struct {
 // refObj tracks a group of locks with an optional timer for auto-unlocking.
 type refObj struct {
 	refs []string
+	keys []string
 	tm   *time.Timer
 }
 
@@ -104,12 +106,13 @@ func WithLogger(l logger) Option {
 // the context is canceled.
 func (gl *GuardianLocker) Guard(ctx *context.Context, handler func(*context.Context) error,
 	lockIDs ...string) (err error) {
-	for _, lockID := range lockIDs {
-		gl.lockItem(lockID)
+	keys := sortedUniqueKeys(lockIDs)
+	for _, key := range keys {
+		gl.lockItem(key)
 	}
 	defer func() {
-		for _, lockID := range lockIDs {
-			gl.unlockItem(lockID)
+		for _, key := range keys {
+			gl.unlockItem(key)
 		}
 	}()
 	if gl.timeout <= 0 && ctx.Done() == nil {
@@ -150,6 +153,15 @@ func (gl *GuardianLocker) UnguardIDs(refID string) []string {
 		return gl.unlockWithReference(refID)
 	}
 	return nil
+}
+
+func sortedUniqueKeys(keys []string) []string {
+	if len(keys) < 2 {
+		return keys
+	}
+	keys = slices.Clone(keys)
+	slices.Sort(keys)
+	return slices.Compact(keys)
 }
 
 // lockItem acquires a lock for the given item ID.
@@ -208,6 +220,7 @@ func (gl *GuardianLocker) lockWithReference(refID string, lkIDs ...string) strin
 			return "" // refID already in use, abort without locking
 		}
 	}
+	keys := sortedUniqueKeys(lkIDs)
 	var tm *time.Timer
 	if gl.timeout > 0 {
 		// Set up auto-unlock after timeout period.
@@ -219,11 +232,12 @@ func (gl *GuardianLocker) lockWithReference(refID string, lkIDs ...string) strin
 	}
 	gl.refs[refID] = &refObj{
 		refs: lkIDs,
+		keys: keys,
 		tm:   tm,
 	}
 	gl.refsMux.Unlock()
 	// execute the real locks
-	for _, lk := range lkIDs {
+	for _, lk := range keys {
 		gl.lockItem(lk)
 	}
 	gl.unlockItem(refID)
@@ -247,7 +261,7 @@ func (gl *GuardianLocker) unlockWithReference(refID string) (lkIDs []string) {
 	delete(gl.refs, refID)
 	gl.refsMux.Unlock()
 	lkIDs = ref.refs
-	for _, lk := range lkIDs {
+	for _, lk := range ref.keys {
 		gl.unlockItem(lk)
 	}
 	gl.unlockItem(refID)
