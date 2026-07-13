@@ -45,6 +45,7 @@ type logger interface {
 
 // GuardianLocker is an optimized locking system that manages locks by string keys.
 type GuardianLocker struct {
+	timeout time.Duration
 	lkMux   sync.Mutex // protects the locks
 	locks   map[string]*itemLock
 	refsMux sync.RWMutex       // protects the map
@@ -81,6 +82,14 @@ func New(opts ...Option) *GuardianLocker {
 	return gl
 }
 
+// WithTimeout sets the timeout used by Guard and GuardIDs.
+// Non-positive durations disable the timeout.
+func WithTimeout(d time.Duration) Option {
+	return func(gl *GuardianLocker) {
+		gl.timeout = d
+	}
+}
+
 // WithLogger sets a custom logger for the GuardianLocker.
 func WithLogger(l logger) Option {
 	return func(gl *GuardianLocker) {
@@ -91,9 +100,10 @@ func WithLogger(l logger) Option {
 }
 
 // Guard locks the specified IDs, executes the handler, and then unlocks the IDs.
-// Returns the error from handler or nil if it times out/gets cancelled.
+// Returns the error from handler or nil if the configured timeout expires or
+// the context is canceled.
 func (gl *GuardianLocker) Guard(ctx *context.Context, handler func(*context.Context) error,
-	timeout time.Duration, lockIDs ...string) (err error) {
+	lockIDs ...string) (err error) {
 	for _, lockID := range lockIDs {
 		gl.lockItem(lockID)
 	}
@@ -102,15 +112,15 @@ func (gl *GuardianLocker) Guard(ctx *context.Context, handler func(*context.Cont
 			gl.unlockItem(lockID)
 		}
 	}()
-	if timeout <= 0 && ctx.Done() == nil {
+	if gl.timeout <= 0 && ctx.Done() == nil {
 		return handler(ctx)
 	}
 	errChan := make(chan error, 1)
 
 	// Apply timeout if specified.
-	if timeout > 0 {
+	if gl.timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
+		ctx, cancel = context.WithTimeout(ctx, gl.timeout)
 		defer cancel()
 	}
 	go func() {
@@ -127,10 +137,10 @@ func (gl *GuardianLocker) Guard(ctx *context.Context, handler func(*context.Cont
 	return
 }
 
-// GuardIDs acquires a lock for the specified duration and returns the
-// reference ID for the lock group acquired.
-func (gl *GuardianLocker) GuardIDs(refID string, timeout time.Duration, lkIDs ...string) string {
-	return gl.lockWithReference(refID, timeout, lkIDs...)
+// GuardIDs locks lkIDs and returns the group's reference ID.
+// A positive timeout unlocks them when it expires.
+func (gl *GuardianLocker) GuardIDs(refID string, lkIDs ...string) string {
+	return gl.lockWithReference(refID, lkIDs...)
 }
 
 // UnguardIDs unlocks all locks associated with the given reference ID.
@@ -176,11 +186,11 @@ func (gl *GuardianLocker) unlockItem(itmID string) {
 
 // lockWithReference acquires locks for the given IDs and associates them with
 // a reference ID.
-// If refID is empty, it generates a new UUID. If timeout is positive, it
-// automatically unlocks after the timeout duration.
+// If refID is empty, it generates a new UUID. If the configured timeout is
+// positive, it automatically unlocks after that duration.
 // Returns the reference ID on success or empty string if the reference ID is
 // already in use.
-func (gl *GuardianLocker) lockWithReference(refID string, timeout time.Duration, lkIDs ...string) string {
+func (gl *GuardianLocker) lockWithReference(refID string, lkIDs ...string) string {
 	var refEmpty bool
 	if refID == "" {
 		refEmpty = true
@@ -199,9 +209,9 @@ func (gl *GuardianLocker) lockWithReference(refID string, timeout time.Duration,
 		}
 	}
 	var tm *time.Timer
-	if timeout != 0 {
+	if gl.timeout > 0 {
 		// Set up auto-unlock after timeout period.
-		tm = time.AfterFunc(timeout, func() {
+		tm = time.AfterFunc(gl.timeout, func() {
 			if lkIDs := gl.unlockWithReference(refID); len(lkIDs) != 0 {
 				gl.logger.Warning(fmt.Sprintf("<Guardian> force timing-out locks: %+v", lkIDs))
 			}
