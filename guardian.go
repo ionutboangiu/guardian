@@ -98,6 +98,14 @@ func (gl *GuardianLocker) Guard(ctx *context.Context, handler func(*context.Cont
 	for _, lockID := range lockIDs {
 		gl.lockItem(lockID)
 	}
+	defer func() {
+		for _, lockID := range lockIDs {
+			gl.unlockItem(lockID)
+		}
+	}()
+	if timeout <= 0 && ctx.Done() == nil {
+		return handler(ctx)
+	}
 	errChan := make(chan error, 1)
 
 	// Apply timeout if specified.
@@ -116,9 +124,6 @@ func (gl *GuardianLocker) Guard(ctx *context.Context, handler func(*context.Cont
 	case <-ctx.Done(): // ignore context error but log it
 		gl.logger.Warning(fmt.Sprintf(
 			"<Guardian> force timing-out locks: <%+v> because: <%s> ", lockIDs, ctx.Err()))
-	}
-	for _, lockID := range lockIDs {
-		gl.unlockItem(lockID)
 	}
 	return
 }
