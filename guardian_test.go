@@ -19,217 +19,266 @@ package guardian
 
 import (
 	"errors"
-	"reflect"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cgrates/birpc/context"
-	"github.com/google/uuid"
 )
 
-func delayHandler(_ *context.Context) error {
-	time.Sleep(100 * time.Millisecond)
+type warningLogger struct {
+	warnings chan string
+}
+
+func (l *warningLogger) Warning(msg string) error {
+	l.warnings <- msg
 	return nil
 }
 
-// Forks 3 groups of workers and makes sure that the time for execution is the one we expect for all 15 goroutines (with 100ms )
-func TestGuardianMultipleKeys(t *testing.T) {
-	gl := New()
-	tStart := time.Now()
-	maxIter := 5
-	var wg sync.WaitGroup
-	keys := []string{"test1", "test2", "test3"}
-	for range maxIter {
-		for _, key := range keys {
-			wg.Add(1)
-			go func(key string) {
-				gl.Guard(context.TODO(), delayHandler, key)
-				wg.Done()
-			}(key)
-		}
-	}
-	wg.Wait()
-	mustExecDur := time.Duration(maxIter*100) * time.Millisecond
-	if execTime := time.Since(tStart); execTime < mustExecDur ||
-		execTime > mustExecDur+100*time.Millisecond {
-		t.Errorf("Execution took: %v", execTime)
-	}
-	for _, key := range keys {
-		if _, hasKey := gl.locks[key]; hasKey {
-			t.Errorf("Possible memleak for key: %s", key)
-		}
-	}
+func (gl *GuardianLocker) lockEntryCount() int {
+	gl.lkMux.Lock()
+	defer gl.lkMux.Unlock()
+	return len(gl.locks)
 }
 
-func TestGuardianTimeout(t *testing.T) {
-	gl := New(WithTimeout(10 * time.Millisecond))
-	tStart := time.Now()
-	maxIter := 5
-	var wg sync.WaitGroup
-	keys := []string{"test1", "test2", "test3"}
-	for range maxIter {
-		for _, key := range keys {
-			wg.Add(1)
-			go func(key string) {
-				gl.Guard(context.TODO(), delayHandler, key)
-				wg.Done()
-			}(key)
-		}
+func (gl *GuardianLocker) lockRefCount(key string) int64 {
+	gl.lkMux.Lock()
+	defer gl.lkMux.Unlock()
+	if lock := gl.locks[key]; lock != nil {
+		return lock.cnt
 	}
-	wg.Wait()
-	mustExecDur := time.Duration(maxIter*10) * time.Millisecond
-	if execTime := time.Since(tStart); execTime < mustExecDur ||
-		execTime > mustExecDur+100*time.Millisecond {
-		t.Errorf("Execution took: %v", execTime)
-	}
-	for _, key := range keys {
-		if _, hasKey := gl.locks[key]; hasKey {
-			t.Error("Possible memleak")
-		}
-	}
+	return 0
 }
 
-func TestGuardianGuardIDs(t *testing.T) {
-	lockDur := 2 * time.Millisecond
-	gl := New(WithTimeout(lockDur))
-
-	//lock with 3 keys
-	lockIDs := []string{"test1", "test2", "test3"}
-
-	// lock 3 items
-	tStart := time.Now()
-	gl.GuardIDs("", lockIDs...)
-	for _, lockID := range lockIDs {
-		if itmLock, hasKey := gl.locks[lockID]; !hasKey {
-			t.Errorf("Cannot find lock for lockID: %s", lockID)
-		} else if itmLock.cnt != 1 {
-			t.Errorf("Unexpected itmLock found: %+v", itmLock)
+func waitFor(t *testing.T, d time.Duration, label string, ready func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !ready() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", label)
 		}
+		time.Sleep(time.Millisecond)
 	}
-	// second lock to test counter
-	go gl.GuardIDs("", lockIDs[1:]...)
-	time.Sleep(time.Millisecond) // give time for goroutine to lock
-	// check if counters were properly increased
-	gl.lkMux.Lock()
-	lkID := lockIDs[0]
-	eCnt := int64(1)
-	if itmLock, hasKey := gl.locks[lkID]; !hasKey {
-		t.Errorf("Cannot find lock for lockID: %s", lkID)
-	} else if itmLock.cnt != eCnt {
-		t.Errorf("itemLock %q counter=%d, want %d", lkID, itmLock.cnt, eCnt)
-	}
-	lkID = lockIDs[1]
-	eCnt = int64(2)
-	if itmLock, hasKey := gl.locks[lkID]; !hasKey {
-		t.Errorf("Cannot find lock for lockID: %s", lkID)
-	} else if itmLock.cnt != eCnt {
-		t.Errorf("itemLock %q counter=%d, want %d", lkID, itmLock.cnt, eCnt)
-	}
-	lkID = lockIDs[2]
-	eCnt = int64(1) // we did not manage to increase it yet since it did not pass first lock
-	if itmLock, hasKey := gl.locks[lkID]; !hasKey {
-		t.Errorf("Cannot find lock for lockID: %s", lkID)
-	} else if itmLock.cnt != eCnt {
-		t.Errorf("itemLock %q counter=%d, want %d", lkID, itmLock.cnt, eCnt)
-	}
-	gl.lkMux.Unlock()
-	time.Sleep(2*lockDur + 50*time.Millisecond) // give time to unlock before proceeding
-
-	// make sure all counters were removed
-	gl.lkMux.Lock()
-	for _, lockID := range lockIDs {
-		if _, hasKey := gl.locks[lockID]; hasKey {
-			t.Errorf("Unexpected lockID found: %s", lockID)
-		}
-	}
-	gl.lkMux.Unlock()
-
-	// test lock  without timer
-	gl = New()
-	refID := gl.GuardIDs("", lockIDs...)
-
-	if totalLockDur := time.Since(tStart); totalLockDur < lockDur {
-		t.Errorf("Lock duration too small")
-	}
-	time.Sleep(30 * time.Millisecond)
-	// making sure the items stay locked
-	gl.lkMux.Lock()
-	if len(gl.locks) != 3 {
-		t.Errorf("locks should have 3 elements, have: %+v", gl.locks)
-	}
-	for _, lkID := range lockIDs {
-		if itmLock, hasKey := gl.locks[lkID]; !hasKey {
-			t.Errorf("Cannot find lock for lockID: %s", lkID)
-		} else if itmLock.cnt != 1 {
-			t.Errorf("itemLock %q counter=%d, want %d", lkID, itmLock.cnt, 1)
-		}
-	}
-	gl.lkMux.Unlock()
-	gl.UnguardIDs(refID)
-	// make sure items were unlocked
-	gl.lkMux.Lock()
-	if len(gl.locks) != 0 {
-		t.Errorf("locks should have 0 elements, has: %+v", gl.locks)
-	}
-	gl.lkMux.Unlock()
-}
-
-// TestGuardianGuardIDsConcurrent executes GuardIDs concurrently
-func TestGuardianGuardIDsConcurrent(t *testing.T) {
-	gl := New()
-	maxIter := 500
-	var wg sync.WaitGroup
-	keys := []string{"test1", "test2", "test3"}
-	refID := uuid.NewString()
-	for range maxIter {
-		wg.Add(1)
-		go func() {
-			if retRefID := gl.GuardIDs(refID, keys...); retRefID != "" {
-				if lkIDs := gl.UnguardIDs(refID); !reflect.DeepEqual(keys, lkIDs) {
-					t.Errorf("expecting: %+v, received: %+v", keys, lkIDs)
-				}
-			}
-			wg.Done()
-		}()
-	}
-	wg.Wait()
-	if len(gl.locks) != 0 {
-		t.Errorf("Possible memleak for locks: %+v", gl.locks)
-	}
-	if len(gl.refs) != 0 {
-		t.Errorf("Possible memleak for refs: %+v", gl.refs)
-	}
-}
-
-func TestGuardianGuardIDsTimeoutConcurrent(t *testing.T) {
-	gl := New(WithTimeout(time.Microsecond))
-	maxIter := 50
-	var wg sync.WaitGroup
-	keys := []string{"test1", "test2", "test3"}
-	refID := uuid.NewString()
-	for range maxIter {
-		wg.Add(1)
-		go func() {
-			gl.GuardIDs(refID, keys...)
-			wg.Done()
-		}()
-	}
-	wg.Wait()
-	time.Sleep(10 * time.Millisecond)
-	gl.lkMux.Lock()
-	if len(gl.locks) != 0 {
-		t.Errorf("Possible memleak for locks: %+v", gl.locks)
-	}
-	gl.lkMux.Unlock()
-	gl.refsMux.Lock()
-	if len(gl.refs) != 0 {
-		t.Errorf("Possible memleak for refs: %+v", gl.refs)
-	}
-	gl.refsMux.Unlock()
 }
 
 func noopHandler(*context.Context) error { return nil }
+
+func TestLockBlocksSameKey(t *testing.T) {
+	gl := New()
+	unlock := gl.Lock("k")
+	done := make(chan struct{})
+	go func() {
+		unlock := gl.Lock("k")
+		unlock()
+		close(done)
+	}()
+	waitFor(t, time.Second, "second Lock", func() bool {
+		return gl.lockRefCount("k") == 2
+	})
+	select {
+	case <-done:
+		t.Fatal("second Lock acquired before unlock")
+	default:
+	}
+	unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("second Lock did not acquire after unlock")
+	}
+	if n := gl.lockEntryCount(); n != 0 {
+		t.Errorf("live locks = %d, want 0", n)
+	}
+}
+
+func TestLockDuplicateKeys(t *testing.T) {
+	gl := New()
+	done := make(chan struct{})
+	go func() {
+		unlock := gl.Lock("b", "a", "b")
+		unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("duplicate keys deadlocked")
+	}
+	if n := gl.lockEntryCount(); n != 0 {
+		t.Errorf("live locks = %d, want 0", n)
+	}
+}
+
+func TestLockOppositeKeyOrder(t *testing.T) {
+	gl := New()
+	gl.lockItem("a")
+	gl.lockItem("b")
+	done := make(chan struct{}, 2)
+	for _, keys := range [][]string{{"a", "b"}, {"b", "a"}} {
+		go func(keys []string) {
+			unlock := gl.Lock(keys...)
+			unlock()
+			done <- struct{}{}
+		}(keys)
+	}
+	waitFor(t, time.Second, "both lock calls queued", func() bool {
+		return gl.lockRefCount("a")+gl.lockRefCount("b") == 4
+	})
+	gl.unlockItem("a")
+	gl.unlockItem("b")
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("opposite key order deadlocked")
+		}
+	}
+	if n := gl.lockEntryCount(); n != 0 {
+		t.Errorf("live locks = %d, want 0", n)
+	}
+}
+
+func TestLockEmptyKeys(t *testing.T) {
+	gl := New()
+	gl.Lock()()
+	gl.Lock("")()
+	if n := gl.lockEntryCount(); n != 0 {
+		t.Errorf("live locks = %d, want 0", n)
+	}
+}
+
+func TestLockCopiesKeys(t *testing.T) {
+	for _, original := range [][]string{{"a"}, {"b", "a"}} {
+		gl := New()
+		keys := append([]string(nil), original...)
+		unlock := gl.Lock(keys...)
+		for i := range keys {
+			keys[i] = "changed"
+		}
+		unlock()
+		if n := gl.lockEntryCount(); n != 0 {
+			t.Errorf("Lock(%v) left %d live locks after input changed", original, n)
+		}
+	}
+}
+
+func TestLockTimeoutUnlocksKey(t *testing.T) {
+	logger := &warningLogger{warnings: make(chan string, 2)}
+	gl := New(WithTimeout(20*time.Millisecond), WithLogger(logger))
+	unlock := gl.Lock("k")
+	done := make(chan struct{})
+	go func() {
+		unlock := gl.Lock("k")
+		unlock()
+		close(done)
+	}()
+	waitFor(t, time.Second, "second Lock", func() bool {
+		return gl.lockRefCount("k") == 2
+	})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("second Lock stayed blocked after timeout")
+	}
+	unlock()
+	select {
+	case warning := <-logger.warnings:
+		if !strings.Contains(warning, "force timing-out locks: [k]") {
+			t.Errorf("unexpected warning: %q", warning)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout warning was not logged")
+	}
+	if n := gl.lockEntryCount(); n != 0 {
+		t.Errorf("live locks = %d, want 0", n)
+	}
+}
+
+func TestGuardHandlerError(t *testing.T) {
+	gl := New()
+	mockErr := errors.New("mock error")
+	err := gl.Guard(context.TODO(), func(*context.Context) error {
+		return mockErr
+	}, "b", "a", "b")
+	if !errors.Is(err, mockErr) {
+		t.Errorf("Guard returned %v, want %v", err, mockErr)
+	}
+	if n := gl.lockEntryCount(); n != 0 {
+		t.Errorf("live locks = %d, want 0", n)
+	}
+}
+
+func TestGuardTimeoutReleasesLock(t *testing.T) {
+	gl := New(WithTimeout(20 * time.Millisecond))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	guardDone := make(chan error, 1)
+	go func() {
+		guardDone <- gl.Guard(context.TODO(), func(*context.Context) error {
+			close(started)
+			<-release
+			close(handlerDone)
+			return nil
+		}, "k")
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	select {
+	case err := <-guardDone:
+		if err != nil {
+			t.Errorf("Guard returned %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Guard did not return after timeout")
+	}
+	lockDone := make(chan struct{})
+	go func() {
+		unlock := gl.Lock("k")
+		unlock()
+		close(lockDone)
+	}()
+	select {
+	case <-lockDone:
+	case <-time.After(time.Second):
+		t.Fatal("lock was not released after Guard timeout")
+	}
+	select {
+	case <-handlerDone:
+		t.Fatal("handler returned before release")
+	default:
+	}
+	close(release)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not return")
+	}
+	if n := gl.lockEntryCount(); n != 0 {
+		t.Errorf("live locks = %d, want 0", n)
+	}
+}
+
+func BenchmarkLockUncontended(b *testing.B) {
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{"without timeout", 0},
+		{"with timeout", time.Hour},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			gl := New(WithTimeout(tc.timeout))
+			for b.Loop() {
+				unlock := gl.Lock("k")
+				unlock()
+			}
+		})
+	}
+}
 
 func BenchmarkGuardUncontended(b *testing.B) {
 	for _, tc := range []struct {
@@ -270,59 +319,5 @@ func BenchmarkGuardContended(b *testing.B) {
 				}
 			})
 		})
-	}
-}
-
-func TestGuardianLockItemUnlockItem(t *testing.T) {
-	gl := New()
-	itemID := ""
-	gl.lockItem(itemID)
-	gl.unlockItem(itemID)
-	if itemID != "" {
-		t.Errorf("\nExpected <%+v>, \nReceived <%+v>", "", itemID)
-	}
-}
-
-func TestGuardianLockUnlockWithReference(t *testing.T) {
-	gl := New()
-	refID := ""
-	gl.lockWithReference(refID, []string{}...)
-	gl.unlockWithReference(refID)
-	if refID != "" {
-		t.Errorf("\nExpected <%+v>, \nReceived <%+v>", "", refID)
-	}
-}
-
-func TestGuardianGuardUnguardIDs(t *testing.T) {
-	gl := New(WithTimeout(time.Second))
-	refID := ""
-	lkIDs := []string{"test1", "test2", "test3"}
-	gl.GuardIDs(refID, lkIDs...)
-	gl.UnguardIDs(refID)
-	if refID != "" {
-		t.Errorf("\nExpected <%+v>, \nReceived <%+v>", "", refID)
-	}
-}
-
-func TestGuardianGuardUnguardIDsCase2(t *testing.T) {
-	gl := New(WithTimeout(10 * time.Millisecond))
-	mockErr := errors.New("mock_error")
-	lkIDs := []string{"test1", "test2", "test3"}
-	err := gl.Guard(context.TODO(), func(_ *context.Context) error {
-		return mockErr
-	}, lkIDs...)
-	if err == nil || err != mockErr {
-		t.Errorf("\nExpected <%+v>, \nReceived <%+v>", mockErr, err)
-	}
-}
-
-func TestSortedUniqueKeys(t *testing.T) {
-	input := []string{"b", "a", "b"}
-	want := []string{"a", "b"}
-	if got := sortedUniqueKeys(input); !reflect.DeepEqual(got, want) {
-		t.Errorf("sortedUniqueKeys() = %v, want %v", got, want)
-	}
-	if !reflect.DeepEqual(input, []string{"b", "a", "b"}) {
-		t.Errorf("sortedUniqueKeys() modified input: %v", input)
 	}
 }
