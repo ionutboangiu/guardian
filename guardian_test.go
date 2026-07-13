@@ -20,7 +20,6 @@ package guardian
 import (
 	"errors"
 	"reflect"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -230,73 +229,48 @@ func TestGuardianGuardIDsTimeoutConcurrent(t *testing.T) {
 	gl.refsMux.Unlock()
 }
 
-// BenchmarkGuard-8      	  200000	     13759 ns/op
-func BenchmarkGuard(b *testing.B) {
-	gl := New()
-	var wg sync.WaitGroup
-	for b.Loop() {
-		wg.Add(3)
-		go func() {
-			defer wg.Done()
-			gl.Guard(context.TODO(), func(*context.Context) error {
-				time.Sleep(time.Microsecond)
-				return nil
-			}, 0, "1")
-		}()
-		go func() {
-			defer wg.Done()
-			gl.Guard(context.TODO(), func(*context.Context) error {
-				time.Sleep(time.Microsecond)
-				return nil
-			}, 0, "2")
-		}()
-		go func() {
-			defer wg.Done()
-			gl.Guard(context.TODO(), func(*context.Context) error {
-				time.Sleep(time.Microsecond)
-				return nil
-			}, 0, "1")
-		}()
-	}
-	wg.Wait()
-}
+func noopHandler(*context.Context) error { return nil }
 
-// BenchmarkGuardian-8   	 1000000	      5794 ns/op
-func BenchmarkGuardian(b *testing.B) {
+func BenchmarkGuardUncontended(b *testing.B) {
 	gl := New()
-	var wg sync.WaitGroup
-	var i int // used as lockID
-	for b.Loop() {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			gl.Guard(context.TODO(), func(*context.Context) error {
-				time.Sleep(time.Microsecond)
-				return nil
-			}, 0, strconv.Itoa(i))
-		}()
-		i++
-	}
-	wg.Wait()
-}
-
-// BenchmarkGuardIDs-8   	 1000000	      8732 ns/op
-func BenchmarkGuardIDs(b *testing.B) {
-	gl := New()
-	var wg sync.WaitGroup
-	var i int // used as lockID
-	for b.Loop() {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if refID := gl.GuardIDs("", 0, strconv.Itoa(i)); refID != "" {
-				time.Sleep(time.Microsecond)
-				gl.UnguardIDs(refID)
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{"without timeout", 0},
+		{"with timeout", time.Hour},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			ctx := context.TODO()
+			for b.Loop() {
+				if err := gl.Guard(ctx, noopHandler, tc.timeout, "k"); err != nil {
+					b.Fatal(err)
+				}
 			}
-		}()
-		i++
+		})
 	}
-	wg.Wait()
+}
+
+func BenchmarkGuardContended(b *testing.B) {
+	gl := New()
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{"without timeout", 0},
+		{"with timeout", time.Hour},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				ctx := context.TODO()
+				for pb.Next() {
+					if err := gl.Guard(ctx, noopHandler, tc.timeout, "k"); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		})
+	}
 }
 
 func TestGuardianLockItemUnlockItem(t *testing.T) {
