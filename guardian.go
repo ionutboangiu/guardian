@@ -47,9 +47,6 @@ type itemLock struct {
 	cnt int64
 }
 
-// Guardian is the global package variable.
-var Guardian = New()
-
 // New creates a GuardianLocker with the provided options.
 func New(opts ...Option) *GuardianLocker {
 	gl := &GuardianLocker{
