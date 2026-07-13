@@ -52,9 +52,8 @@ type GuardianLocker struct {
 	logger  logger
 }
 
-// itemLock holds the channel used for locking and a counter for tracking lock references.
 type itemLock struct {
-	lk  chan struct{}
+	mu  sync.Mutex
 	cnt int64
 }
 
@@ -151,13 +150,12 @@ func (gl *GuardianLocker) lockItem(itmID string) {
 	gl.lkMux.Lock()
 	itmLock, exists := gl.locks[itmID]
 	if !exists {
-		gl.locks[itmID] = &itemLock{lk: make(chan struct{}, 1), cnt: 1}
-		gl.lkMux.Unlock()
-		return
+		itmLock = &itemLock{}
+		gl.locks[itmID] = itmLock
 	}
 	itmLock.cnt++
 	gl.lkMux.Unlock()
-	<-itmLock.lk
+	itmLock.mu.Lock()
 }
 
 // unlockItem releases a lock for the given item ID.
@@ -173,7 +171,7 @@ func (gl *GuardianLocker) unlockItem(itmID string) {
 		delete(gl.locks, itmID)
 	}
 	gl.lkMux.Unlock()
-	itmLock.lk <- struct{}{}
+	itmLock.mu.Unlock()
 }
 
 // lockWithReference acquires locks for the given IDs and associates them with
