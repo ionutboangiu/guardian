@@ -27,53 +27,54 @@ import (
 	"github.com/cgrates/birpc/context"
 )
 
-// Option configures a GuardianLocker.
-type Option func(*GuardianLocker)
+// Option configures a Locker.
+type Option func(*Locker)
 
 type logger interface {
 	Warning(string) error
 }
 
-// GuardianLocker is an optimized locking system that manages locks by string keys.
-type GuardianLocker struct {
+// Locker is an optimized locking system that manages locks by string keys.
+type Locker struct {
 	timeout time.Duration
-	lkMux   sync.Mutex // protects the locks
-	locks   map[string]*itemLock
 	logger  logger
+
+	locksMu sync.Mutex
+	locks   map[string]*itemLock
 }
 
 type itemLock struct {
-	mu  sync.Mutex
-	cnt int64
+	mu    sync.Mutex
+	count int
 }
 
-// New creates a GuardianLocker with the provided options.
-func New(opts ...Option) *GuardianLocker {
-	gl := &GuardianLocker{
+// New creates a Locker with the provided options.
+func New(opts ...Option) *Locker {
+	l := &Locker{
 		locks:  make(map[string]*itemLock),
 		logger: nopLogger{},
 	}
 
 	for _, opt := range opts {
-		opt(gl)
+		opt(l)
 	}
 
-	return gl
+	return l
 }
 
 // WithTimeout sets the timeout for Guard and Lock.
 // Non-positive durations disable the timeout.
 func WithTimeout(d time.Duration) Option {
-	return func(gl *GuardianLocker) {
-		gl.timeout = d
+	return func(l *Locker) {
+		l.timeout = d
 	}
 }
 
-// WithLogger sets a custom logger for the GuardianLocker.
-func WithLogger(l logger) Option {
-	return func(gl *GuardianLocker) {
-		if l != nil {
-			gl.logger = l
+// WithLogger sets a custom logger for the Locker.
+func WithLogger(logger logger) Option {
+	return func(l *Locker) {
+		if logger != nil {
+			l.logger = logger
 		}
 	}
 }
@@ -81,18 +82,18 @@ func WithLogger(l logger) Option {
 // Lock locks keys and returns an unlock function.
 // The timeout starts once all keys are locked. Calling unlock after timeout is
 // safe.
-func (gl *GuardianLocker) Lock(keys ...string) func() {
-	unlock := gl.lockKeys(keys)
-	if gl.timeout <= 0 {
+func (l *Locker) Lock(keys ...string) func() {
+	unlock := l.lockKeys(keys)
+	if l.timeout <= 0 {
 		return unlock
 	}
 	warningKeys := slices.Clone(keys)
 	var once sync.Once
-	timer := time.AfterFunc(gl.timeout, func() {
+	timer := time.AfterFunc(l.timeout, func() {
 		once.Do(func() {
 			unlock()
 			if len(warningKeys) != 0 {
-				_ = gl.logger.Warning(fmt.Sprintf("<Guardian> force timing-out locks: %+v", warningKeys))
+				_ = l.logger.Warning(fmt.Sprintf("<Guardian> force timing-out locks: %+v", warningKeys))
 			}
 		})
 	})
@@ -105,24 +106,24 @@ func (gl *GuardianLocker) Lock(keys ...string) func() {
 // Guard runs handler while holding keys.
 // On timeout or cancellation, it unlocks and returns nil while handler may
 // still run.
-func (gl *GuardianLocker) Guard(ctx *context.Context, handler func(*context.Context) error,
+func (l *Locker) Guard(ctx *context.Context, handler func(*context.Context) error,
 	keys ...string) error {
 	if len(keys) == 1 {
 		key := keys[0]
-		gl.lockItem(key)
-		defer gl.unlockItem(key)
+		l.lockItem(key)
+		defer l.unlockItem(key)
 	} else {
-		unlock := gl.lockKeys(keys)
+		unlock := l.lockKeys(keys)
 		defer unlock()
 	}
-	if gl.timeout <= 0 && ctx.Done() == nil {
+	if l.timeout <= 0 && ctx.Done() == nil {
 		return handler(ctx)
 	}
 	errCh := make(chan error, 1)
 
-	if gl.timeout > 0 {
+	if l.timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, gl.timeout)
+		ctx, cancel = context.WithTimeout(ctx, l.timeout)
 		defer cancel()
 	}
 	go func() {
@@ -133,64 +134,64 @@ func (gl *GuardianLocker) Guard(ctx *context.Context, handler func(*context.Cont
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		_ = gl.logger.Warning(fmt.Sprintf(
+		_ = l.logger.Warning(fmt.Sprintf(
 			"<Guardian> force timing-out locks: <%+v> because: <%s> ", keys, ctx.Err()))
 		return nil
 	}
 }
 
-func (gl *GuardianLocker) lockKeys(keys []string) func() {
+func (l *Locker) lockKeys(keys []string) func() {
 	switch len(keys) {
 	case 0:
 		return func() {}
 	case 1:
 		key := keys[0]
-		gl.lockItem(key)
-		return func() { gl.unlockItem(key) }
+		l.lockItem(key)
+		return func() { l.unlockItem(key) }
 	}
 	keys = slices.Clone(keys)
 	slices.Sort(keys)
 	keys = slices.Compact(keys)
 	for _, key := range keys {
-		gl.lockItem(key)
+		l.lockItem(key)
 	}
 	return func() {
 		for _, key := range keys {
-			gl.unlockItem(key)
+			l.unlockItem(key)
 		}
 	}
 }
 
 // lockItem acquires a lock for the given item ID.
-func (gl *GuardianLocker) lockItem(itmID string) {
-	if itmID == "" {
+func (l *Locker) lockItem(itemID string) {
+	if itemID == "" {
 		return
 	}
-	gl.lkMux.Lock()
-	itmLock, exists := gl.locks[itmID]
+	l.locksMu.Lock()
+	lock, exists := l.locks[itemID]
 	if !exists {
-		itmLock = &itemLock{}
-		gl.locks[itmID] = itmLock
+		lock = &itemLock{}
+		l.locks[itemID] = lock
 	}
-	itmLock.cnt++
-	gl.lkMux.Unlock()
-	itmLock.mu.Lock()
+	lock.count++
+	l.locksMu.Unlock()
+	lock.mu.Lock()
 }
 
 // unlockItem releases a lock for the given item ID.
-func (gl *GuardianLocker) unlockItem(itmID string) {
-	gl.lkMux.Lock()
-	itmLock, exists := gl.locks[itmID]
+func (l *Locker) unlockItem(itemID string) {
+	l.locksMu.Lock()
+	lock, exists := l.locks[itemID]
 	if !exists {
-		gl.lkMux.Unlock()
+		l.locksMu.Unlock()
 		return
 	}
-	itmLock.cnt--
-	if itmLock.cnt == 0 {
-		delete(gl.locks, itmID)
+	lock.count--
+	if lock.count == 0 {
+		delete(l.locks, itemID)
 	}
-	gl.lkMux.Unlock()
-	itmLock.mu.Unlock()
+	l.locksMu.Unlock()
+	lock.mu.Unlock()
 }
 
 type nopLogger struct{}

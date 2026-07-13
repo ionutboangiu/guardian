@@ -35,17 +35,17 @@ func (l *warningLogger) Warning(msg string) error {
 	return nil
 }
 
-func (gl *GuardianLocker) lockEntryCount() int {
-	gl.lkMux.Lock()
-	defer gl.lkMux.Unlock()
-	return len(gl.locks)
+func (l *Locker) lockEntryCount() int {
+	l.locksMu.Lock()
+	defer l.locksMu.Unlock()
+	return len(l.locks)
 }
 
-func (gl *GuardianLocker) lockRefCount(key string) int64 {
-	gl.lkMux.Lock()
-	defer gl.lkMux.Unlock()
-	if lock := gl.locks[key]; lock != nil {
-		return lock.cnt
+func (l *Locker) lockCount(key string) int {
+	l.locksMu.Lock()
+	defer l.locksMu.Unlock()
+	if lock := l.locks[key]; lock != nil {
+		return lock.count
 	}
 	return 0
 }
@@ -64,16 +64,16 @@ func waitFor(t *testing.T, d time.Duration, label string, ready func() bool) {
 func noopHandler(*context.Context) error { return nil }
 
 func TestLockBlocksSameKey(t *testing.T) {
-	gl := New()
-	unlock := gl.Lock("k")
+	locker := New()
+	unlock := locker.Lock("k")
 	done := make(chan struct{})
 	go func() {
-		unlock := gl.Lock("k")
+		unlock := locker.Lock("k")
 		unlock()
 		close(done)
 	}()
 	waitFor(t, time.Second, "second Lock", func() bool {
-		return gl.lockRefCount("k") == 2
+		return locker.lockCount("k") == 2
 	})
 	select {
 	case <-done:
@@ -86,16 +86,16 @@ func TestLockBlocksSameKey(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("second Lock did not acquire after unlock")
 	}
-	if n := gl.lockEntryCount(); n != 0 {
+	if n := locker.lockEntryCount(); n != 0 {
 		t.Errorf("live locks = %d, want 0", n)
 	}
 }
 
 func TestLockDuplicateKeys(t *testing.T) {
-	gl := New()
+	locker := New()
 	done := make(chan struct{})
 	go func() {
-		unlock := gl.Lock("b", "a", "b")
+		unlock := locker.Lock("b", "a", "b")
 		unlock()
 		close(done)
 	}()
@@ -104,28 +104,28 @@ func TestLockDuplicateKeys(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("duplicate keys deadlocked")
 	}
-	if n := gl.lockEntryCount(); n != 0 {
+	if n := locker.lockEntryCount(); n != 0 {
 		t.Errorf("live locks = %d, want 0", n)
 	}
 }
 
 func TestLockOppositeKeyOrder(t *testing.T) {
-	gl := New()
-	gl.lockItem("a")
-	gl.lockItem("b")
+	locker := New()
+	locker.lockItem("a")
+	locker.lockItem("b")
 	done := make(chan struct{}, 2)
 	for _, keys := range [][]string{{"a", "b"}, {"b", "a"}} {
 		go func(keys []string) {
-			unlock := gl.Lock(keys...)
+			unlock := locker.Lock(keys...)
 			unlock()
 			done <- struct{}{}
 		}(keys)
 	}
 	waitFor(t, time.Second, "both lock calls queued", func() bool {
-		return gl.lockRefCount("a")+gl.lockRefCount("b") == 4
+		return locker.lockCount("a")+locker.lockCount("b") == 4
 	})
-	gl.unlockItem("a")
-	gl.unlockItem("b")
+	locker.unlockItem("a")
+	locker.unlockItem("b")
 	for range 2 {
 		select {
 		case <-done:
@@ -133,30 +133,30 @@ func TestLockOppositeKeyOrder(t *testing.T) {
 			t.Fatal("opposite key order deadlocked")
 		}
 	}
-	if n := gl.lockEntryCount(); n != 0 {
+	if n := locker.lockEntryCount(); n != 0 {
 		t.Errorf("live locks = %d, want 0", n)
 	}
 }
 
 func TestLockEmptyKeys(t *testing.T) {
-	gl := New()
-	gl.Lock()()
-	gl.Lock("")()
-	if n := gl.lockEntryCount(); n != 0 {
+	locker := New()
+	locker.Lock()()
+	locker.Lock("")()
+	if n := locker.lockEntryCount(); n != 0 {
 		t.Errorf("live locks = %d, want 0", n)
 	}
 }
 
 func TestLockCopiesKeys(t *testing.T) {
 	for _, original := range [][]string{{"a"}, {"b", "a"}} {
-		gl := New()
+		locker := New()
 		keys := append([]string(nil), original...)
-		unlock := gl.Lock(keys...)
+		unlock := locker.Lock(keys...)
 		for i := range keys {
 			keys[i] = "changed"
 		}
 		unlock()
-		if n := gl.lockEntryCount(); n != 0 {
+		if n := locker.lockEntryCount(); n != 0 {
 			t.Errorf("Lock(%v) left %d live locks after input changed", original, n)
 		}
 	}
@@ -164,16 +164,16 @@ func TestLockCopiesKeys(t *testing.T) {
 
 func TestLockTimeoutUnlocksKey(t *testing.T) {
 	logger := &warningLogger{warnings: make(chan string, 2)}
-	gl := New(WithTimeout(20*time.Millisecond), WithLogger(logger))
-	unlock := gl.Lock("k")
+	locker := New(WithTimeout(20*time.Millisecond), WithLogger(logger))
+	unlock := locker.Lock("k")
 	done := make(chan struct{})
 	go func() {
-		unlock := gl.Lock("k")
+		unlock := locker.Lock("k")
 		unlock()
 		close(done)
 	}()
 	waitFor(t, time.Second, "second Lock", func() bool {
-		return gl.lockRefCount("k") == 2
+		return locker.lockCount("k") == 2
 	})
 	select {
 	case <-done:
@@ -189,33 +189,33 @@ func TestLockTimeoutUnlocksKey(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout warning was not logged")
 	}
-	if n := gl.lockEntryCount(); n != 0 {
+	if n := locker.lockEntryCount(); n != 0 {
 		t.Errorf("live locks = %d, want 0", n)
 	}
 }
 
 func TestGuardHandlerError(t *testing.T) {
-	gl := New()
+	locker := New()
 	mockErr := errors.New("mock error")
-	err := gl.Guard(context.TODO(), func(*context.Context) error {
+	err := locker.Guard(context.TODO(), func(*context.Context) error {
 		return mockErr
 	}, "b", "a", "b")
 	if !errors.Is(err, mockErr) {
 		t.Errorf("Guard returned %v, want %v", err, mockErr)
 	}
-	if n := gl.lockEntryCount(); n != 0 {
+	if n := locker.lockEntryCount(); n != 0 {
 		t.Errorf("live locks = %d, want 0", n)
 	}
 }
 
 func TestGuardTimeoutReleasesLock(t *testing.T) {
-	gl := New(WithTimeout(20 * time.Millisecond))
+	locker := New(WithTimeout(20 * time.Millisecond))
 	started := make(chan struct{})
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
 	guardDone := make(chan error, 1)
 	go func() {
-		guardDone <- gl.Guard(context.TODO(), func(*context.Context) error {
+		guardDone <- locker.Guard(context.TODO(), func(*context.Context) error {
 			close(started)
 			<-release
 			close(handlerDone)
@@ -237,7 +237,7 @@ func TestGuardTimeoutReleasesLock(t *testing.T) {
 	}
 	lockDone := make(chan struct{})
 	go func() {
-		unlock := gl.Lock("k")
+		unlock := locker.Lock("k")
 		unlock()
 		close(lockDone)
 	}()
@@ -257,7 +257,7 @@ func TestGuardTimeoutReleasesLock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("handler did not return")
 	}
-	if n := gl.lockEntryCount(); n != 0 {
+	if n := locker.lockEntryCount(); n != 0 {
 		t.Errorf("live locks = %d, want 0", n)
 	}
 }
@@ -271,9 +271,9 @@ func BenchmarkLockUncontended(b *testing.B) {
 		{"with timeout", time.Hour},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			gl := New(WithTimeout(tc.timeout))
+			locker := New(WithTimeout(tc.timeout))
 			for b.Loop() {
-				unlock := gl.Lock("k")
+				unlock := locker.Lock("k")
 				unlock()
 			}
 		})
@@ -289,10 +289,10 @@ func BenchmarkGuardUncontended(b *testing.B) {
 		{"with timeout", time.Hour},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			gl := New(WithTimeout(tc.timeout))
+			locker := New(WithTimeout(tc.timeout))
 			ctx := context.TODO()
 			for b.Loop() {
-				if err := gl.Guard(ctx, noopHandler, "k"); err != nil {
+				if err := locker.Guard(ctx, noopHandler, "k"); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -309,11 +309,11 @@ func BenchmarkGuardContended(b *testing.B) {
 		{"with timeout", time.Hour},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			gl := New(WithTimeout(tc.timeout))
+			locker := New(WithTimeout(tc.timeout))
 			b.RunParallel(func(pb *testing.PB) {
 				ctx := context.TODO()
 				for pb.Next() {
-					if err := gl.Guard(ctx, noopHandler, "k"); err != nil {
+					if err := locker.Guard(ctx, noopHandler, "k"); err != nil {
 						b.Fatal(err)
 					}
 				}
