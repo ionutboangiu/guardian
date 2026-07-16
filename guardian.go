@@ -19,7 +19,7 @@ type logger interface {
 	Warning(string) error
 }
 
-// Locker is an optimized locking system that manages locks by string keys.
+// Locker manages locks by string keys.
 type Locker struct {
 	timeout time.Duration
 	logger  logger
@@ -47,7 +47,7 @@ func New(opts ...Option) *Locker {
 	return l
 }
 
-// WithTimeout sets the timeout for Guard and Lock.
+// WithTimeout sets the Locker timeout.
 // Non-positive durations disable the timeout.
 func WithTimeout(d time.Duration) Option {
 	return func(l *Locker) {
@@ -147,7 +147,6 @@ func (l *Locker) lockKeys(keys []string) func() {
 	}
 }
 
-// lockItem acquires a lock for the given item ID.
 func (l *Locker) lockItem(itemID string) {
 	if itemID == "" {
 		return
